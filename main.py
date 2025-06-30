@@ -13,7 +13,8 @@ class ForecastRequest(BaseModel):
 
 @app.post("/forecast")
 async def forecast(data: ForecastRequest):
-    df = pd.DataFrame({"ds": data.dates, "y": data.values})
+    df = pd.DataFrame({"ds": pd.to_datetime(data.dates), "y": data.values})
+    df["ds"] = df["ds"].dt.tz_localize(None)
     model = Prophet()
     model.fit(df)
     future = model.make_future_dataframe(periods=data.horizon)
