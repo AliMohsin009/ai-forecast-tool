@@ -1,4 +1,9 @@
 fastapi
 uvicorn
+pydantic
 pandas
+numpy
 prophet
+neuralprophet
+scikit-learn
+flask
