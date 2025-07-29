@@ -3,7 +3,7 @@ uvicorn
 pydantic
 pandas
 numpy
+scikit-learn
 prophet
 neuralprophet
-scikit-learn
-flask
+stripe

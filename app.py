@@ -1,132 +1,219 @@
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, Request, HTTPException, Depends
 from pydantic import BaseModel
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Union
+from fastapi.responses import JSONResponse
 import pandas as pd
 import numpy as np
-from sklearn.metrics import mean_absolute_percentage_error, mean_squared_error
+import os
+import stripe
+import secrets
+from datetime import datetime, timedelta
+from sklearn.metrics import mean_squared_error
 from prophet import Prophet
 from neuralprophet import NeuralProphet
-import uvicorn
-import os
+from math import sqrt
+import logging
+
+# === Configure Logging ===
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("forecast-api")
 
 app = FastAPI()
 
-# === CORS Setup (Allow all for dev — restrict in production) ===
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Replace with your frontend URL in production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# === Stripe Config ===
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+endpoint_secret = os.getenv("STRIPE_WEBHOOK_SECRET")
 
-# === Request Schema ===
+# === In-Memory API Key Store ===
+api_keys = {}  # {"api_key": {"user_id": ..., "plan": ..., "expires_at": ...}}
+
+# === API Key Auth ===
+def verify_api_key(request: Request):
+    if request.url.scheme != "https":
+        raise HTTPException(status_code=403, detail="HTTPS is required.")
+
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing API key.")
+
+    key = auth.split(" ")[1]
+    user = api_keys.get(key)
+    if not user:
+        raise HTTPException(status_code=403, detail="Invalid or expired API key.")
+
+    if user["expires_at"] < datetime.utcnow():
+        raise HTTPException(status_code=403, detail="API key expired.")
+    return user
+
+# === ForecastRequest Schema ===
 class ForecastRequest(BaseModel):
     dates: List[str]
     values: List[float]
-    regressors: Dict[str, List[float]] = {}
+    regressors: Optional[Dict[str, List[float]]] = None
     horizon: int
-    scenario: float = 0.0
-    model_type: Optional[str] = "prophet"  # prophet, neuralprophet, auto
-    hyperparameters: Optional[Dict[str, float]] = {}
+    scenario: int
+    model_type: str
+    changepoint_prior_scale: Optional[float] = 0.05
+    n_epochs: Optional[int] = 100
+    hyperparams: Optional[Dict[str, Union[float, str, int]]] = None
+
+# === Forecast Logic ===
+def run_forecast_logic(req: ForecastRequest, model_name: str):
+    df = pd.DataFrame({"ds": pd.to_datetime(req.dates).tz_localize(None), "y": req.values})
+    if req.regressors:
+        for k, v in req.regressors.items():
+            df[k] = v
+
+    if model_name == "prophet":
+        cps = req.hyperparams.get("changepoint_prior_scale", 0.05)
+        mode = req.hyperparams.get("seasonality_mode", "additive")
+        model = Prophet(changepoint_prior_scale=cps, seasonality_mode=mode)
+        if req.regressors:
+            for col in req.regressors:
+                model.add_regressor(col)
+        model.fit(df)
+        future = model.make_future_dataframe(periods=req.horizon)
+        if req.regressors:
+            for col in req.regressors:
+                future[col] = df[col].tolist() + [df[col].iloc[-1]] * req.horizon
+        forecast = model.predict(future)
+        yhat = forecast["yhat"].tolist()
+        lower = forecast["yhat_lower"].tolist()
+        upper = forecast["yhat_upper"].tolist()
+        ds = forecast["ds"].astype(str).tolist()
+
+    elif model_name == "neuralprophet":
+        n_epochs = req.hyperparams.get("n_epochs", 100)
+        df.rename(columns={"ds": "ds", "y": "y"}, inplace=True)
+        model = NeuralProphet(epochs=n_epochs)
+        if req.regressors:
+            for col in req.regressors:
+                model.add_future_regressor(col)
+        model.fit(df, freq="D")
+        future = model.make_future_dataframe(df, periods=req.horizon)
+        forecast = model.predict(future)
+        yhat = forecast["yhat1"].tolist()
+        lower = [val * 0.9 for val in yhat]
+        upper = [val * 1.1 for val in yhat]
+        ds = forecast["ds"].astype(str).tolist()
+    else:
+        raise ValueError("Unsupported model type.")
+
+    rmse = sqrt(mean_squared_error(df["y"], yhat[:len(df)]))
+    mape = np.mean(np.abs((df["y"] - yhat[:len(df)]) / df["y"])) * 100
+
+    return {
+        "model": model_name,
+        "dates": ds,
+        "forecast": np.round(yhat, 2).tolist(),
+        "lower": np.round(lower, 2).tolist(),
+        "upper": np.round(upper, 2).tolist(),
+        "metrics": {
+            "RMSE": round(rmse, 2),
+            "MAPE (%)": round(mape, 2)
+        }
+    }
 
 # === Forecast Endpoint ===
 @app.post("/forecast")
-async def forecast(data: ForecastRequest):
+async def forecast(data: ForecastRequest, user: dict = Depends(verify_api_key)):
     try:
         if len(data.dates) != len(data.values):
-            raise HTTPException(status_code=400, detail="Dates and values must have the same length.")
+            raise HTTPException(status_code=400, detail="Dates and values must match in length.")
 
-        df = pd.DataFrame({
-            "ds": pd.to_datetime(data.dates),
-            "y": data.values
-        })
+        model_types = ["prophet", "neuralprophet"] if data.model_type == "auto" else [data.model_type.lower()]
+        prophet_cps = [0.01, 0.05, 0.1]
+        seasonality_modes = ["additive", "multiplicative"]
+        neural_epochs = [50, 100]
 
-        # Add regressors to dataframe
-        for name, values in data.regressors.items():
-            if len(values) != len(data.dates):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Regressor '{name}' has length {len(values)} but expected {len(data.dates)}."
-                )
-            df[name] = values
+        best_result = None
+        best_rmse = float("inf")
+        best_meta = {}
 
-        def extend_regressors(original, horizon, scenario):
-            last_val = original.iloc[-1]
-            return original.tolist() + [last_val * (1 + scenario / 100)] * horizon
+        for model in model_types:
+            if model == "prophet":
+                for cps in prophet_cps:
+                    for seasonality in seasonality_modes:
+                        try:
+                            result = run_forecast_logic(ForecastRequest(**data.dict(), model_type="prophet", hyperparams={"changepoint_prior_scale": cps, "seasonality_mode": seasonality}), model)
+                            if result["metrics"]["RMSE"] < best_rmse:
+                                best_result = result
+                                best_rmse = result["metrics"]["RMSE"]
+                                best_meta = {"model": "prophet", "changepoint_prior_scale": cps, "seasonality_mode": seasonality}
+                        except Exception as e:
+                            logger.warning(f"Prophet failed with cps={cps}, seasonality={seasonality}: {e}")
+                            continue
+            elif model == "neuralprophet":
+                for epochs in neural_epochs:
+                    try:
+                        result = run_forecast_logic(ForecastRequest(**data.dict(), model_type="neuralprophet", hyperparams={"n_epochs": epochs}), model)
+                        if result["metrics"]["RMSE"] < best_rmse:
+                            best_result = result
+                            best_rmse = result["metrics"]["RMSE"]
+                            best_meta = {"model": "neuralprophet", "n_epochs": epochs}
+                    except Exception as e:
+                        logger.warning(f"NeuralProphet failed with epochs={epochs}: {e}")
+                        continue
 
-        # === Prophet Runner ===
-        def run_prophet():
-            model = Prophet(
-                seasonality_mode=data.hyperparameters.get("seasonality_mode", "additive")
-            )
-            for name in data.regressors:
-                model.add_regressor(name)
-            model.fit(df)
-            future = model.make_future_dataframe(periods=data.horizon)
-            for name in data.regressors:
-                future[name] = extend_regressors(df[name], data.horizon, data.scenario)
-            forecast = model.predict(future)
-            return forecast, model.predict(df)["yhat"], model
+        if not best_result:
+            raise HTTPException(status_code=500, detail="AutoML failed to produce a valid result.")
 
-        # === NeuralProphet Runner ===
-        def run_neuralprophet():
-            model = NeuralProphet()
-            for name in data.regressors:
-                model.add_future_regressor(name)
-            model.fit(df, freq="D")
-            future = model.make_future_dataframe(df, periods=data.horizon, n_historic_predictions=False)
-            for name in data.regressors:
-                future[name] = extend_regressors(df[name], data.horizon, data.scenario)
-            forecast = model.predict(future)
-            return forecast, model.predict(df)["yhat1"], model
-
-        results = []
-
-        # === Model Selection ===
-        if data.model_type == "prophet":
-            forecast_df, train_pred, _ = run_prophet()
-            results.append(("prophet", forecast_df, train_pred))
-        elif data.model_type == "neuralprophet":
-            forecast_df, train_pred, _ = run_neuralprophet()
-            results.append(("neuralprophet", forecast_df, train_pred))
-        elif data.model_type == "auto":
-            p_forecast, p_pred, _ = run_prophet()
-            n_forecast, n_pred, _ = run_neuralprophet()
-            p_mape = mean_absolute_percentage_error(df["y"], p_pred)
-            n_mape = mean_absolute_percentage_error(df["y"], n_pred)
-            if p_mape <= n_mape:
-                results.append(("prophet", p_forecast, p_pred))
-            else:
-                results.append(("neuralprophet", n_forecast, n_pred))
-        else:
-            raise HTTPException(status_code=400, detail="Invalid model_type provided.")
-
-        # === Output formatting ===
-        model_name, forecast_df, train_pred = results[0]
-        forecast_col = "yhat1" if model_name == "neuralprophet" else "yhat"
-        result = forecast_df.tail(data.horizon)
-
-        mape = float(mean_absolute_percentage_error(df["y"], train_pred)) * 100
-        rmse = float(np.sqrt(mean_squared_error(df["y"], train_pred)))
-
-        return {
-            "model": model_name,
-            "dates": result["ds"].astype(str).tolist(),
-            "forecast": result[forecast_col].round(2).tolist(),
-            "confidence_lower": result.get("yhat_lower", []).round(2).tolist() if "yhat_lower" in result else [],
-            "confidence_upper": result.get("yhat_upper", []).round(2).tolist() if "yhat_upper" in result else [],
-            "metrics": {
-                "MAPE (%)": round(mape, 2),
-                "RMSE": round(rmse, 2)
-            }
-        }
+        best_result["auto_ml_config"] = best_meta
+        return best_result
 
     except Exception as e:
+        logger.error(f"Forecasting error: {e}")
         raise HTTPException(status_code=500, detail=f"Forecasting error: {str(e)}")
 
-# === Run on Render-compatible port ===
+# === Stripe Webhook ===
+@app.post("/webhook/stripe")
+async def stripe_webhook(request: Request):
+    payload = await request.body()
+    sig_header = request.headers.get('stripe-signature')
+
+    try:
+        event = stripe.Webhook.construct_event(payload, sig_header, endpoint_secret)
+    except Exception as e:
+        logger.warning(f"Stripe signature error: {e}")
+        raise HTTPException(status_code=400, detail="Invalid signature")
+
+    if event['type'] == 'checkout.session.completed':
+        session = event['data']['object']
+        email = session.get("customer_email")
+        plan = session.get("metadata", {}).get("plan", "basic")
+
+        new_key = secrets.token_urlsafe(32)
+        expires = datetime.utcnow() + timedelta(days=30)
+        api_keys[new_key] = {
+            "user_id": email,
+            "plan": plan,
+            "expires_at": expires
+        }
+        logger.info(f"[Stripe] Issued key for {email} plan={plan}")
+
+    return {"status": "ok"}
+
+# === Admin: Issue API Key ===
+@app.post("/admin/issue-key")
+async def issue_api_key(user_email: str, plan: str, days_valid: int = 30):
+    new_key = secrets.token_urlsafe(32)
+    expires = datetime.utcnow() + timedelta(days=days_valid)
+    api_keys[new_key] = {
+        "user_id": user_email,
+        "plan": plan,
+        "expires_at": expires
+    }
+    logger.info(f"[Admin] Issued key for {user_email} plan={plan}")
+    return {"api_key": new_key, "expires_at": expires}
+
+# === Health Check ===
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+# === Run Locally ===
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))  # Required for Render
+    import uvicorn
+    port = int(os.environ.get("PORT", 8080))
+    logger.info(f"Starting server on port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
