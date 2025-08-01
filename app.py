@@ -207,8 +207,9 @@ async def issue_api_key(user_email: str, plan: str, days_valid: int = 30):
 async def health():
     return {"status": "ok"}
 
+# === Run Locally or in Render ===
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8080))
-    logger.info(f"Starting server on port {port}")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    port = int(os.environ.get("PORT", 8080))  # <-- This line is critical
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+
