@@ -1,9 +1,9 @@
 fastapi
 uvicorn
-pydantic
 pandas
 numpy
-scikit-learn
+python-dotenv
 prophet
 neuralprophet
 stripe
+scikit-learn

@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import List, Dict, Optional, Union
-from fastapi.responses import JSONResponse
 import pandas as pd
 import numpy as np
 import os
@@ -14,38 +14,35 @@ from neuralprophet import NeuralProphet
 from math import sqrt
 import logging
 
-# === Configure Logging ===
+# === Logging ===
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("forecast-api")
 
 app = FastAPI()
 
-# === Stripe Config ===
+# === Stripe Setup ===
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 endpoint_secret = os.getenv("STRIPE_WEBHOOK_SECRET")
 
 # === In-Memory API Key Store ===
-api_keys = {}  # {"api_key": {"user_id": ..., "plan": ..., "expires_at": ...}}
+api_keys = {}  # Format: {api_key: {user_id, plan, expires_at}}
 
-# === API Key Auth ===
+# === Auth Middleware ===
 def verify_api_key(request: Request):
     if request.url.scheme != "https":
         raise HTTPException(status_code=403, detail="HTTPS is required.")
-
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing API key.")
-
     key = auth.split(" ")[1]
     user = api_keys.get(key)
     if not user:
         raise HTTPException(status_code=403, detail="Invalid or expired API key.")
-
     if user["expires_at"] < datetime.utcnow():
         raise HTTPException(status_code=403, detail="API key expired.")
     return user
 
-# === ForecastRequest Schema ===
+# === Pydantic Schema ===
 class ForecastRequest(BaseModel):
     dates: List[str]
     values: List[float]
@@ -84,7 +81,6 @@ def run_forecast_logic(req: ForecastRequest, model_name: str):
 
     elif model_name == "neuralprophet":
         n_epochs = req.hyperparams.get("n_epochs", 100)
-        df.rename(columns={"ds": "ds", "y": "y"}, inplace=True)
         model = NeuralProphet(epochs=n_epochs)
         if req.regressors:
             for col in req.regressors:
@@ -114,7 +110,7 @@ def run_forecast_logic(req: ForecastRequest, model_name: str):
         }
     }
 
-# === Forecast Endpoint ===
+# === POST /forecast ===
 @app.post("/forecast")
 async def forecast(data: ForecastRequest, user: dict = Depends(verify_api_key)):
     try:
@@ -135,28 +131,31 @@ async def forecast(data: ForecastRequest, user: dict = Depends(verify_api_key)):
                 for cps in prophet_cps:
                     for seasonality in seasonality_modes:
                         try:
-                            result = run_forecast_logic(ForecastRequest(**data.dict(), model_type="prophet", hyperparams={"changepoint_prior_scale": cps, "seasonality_mode": seasonality}), model)
+                            result = run_forecast_logic(
+                                ForecastRequest(**data.dict(), model_type="prophet",
+                                                hyperparams={"changepoint_prior_scale": cps, "seasonality_mode": seasonality}),
+                                "prophet")
                             if result["metrics"]["RMSE"] < best_rmse:
                                 best_result = result
                                 best_rmse = result["metrics"]["RMSE"]
                                 best_meta = {"model": "prophet", "changepoint_prior_scale": cps, "seasonality_mode": seasonality}
                         except Exception as e:
                             logger.warning(f"Prophet failed with cps={cps}, seasonality={seasonality}: {e}")
-                            continue
             elif model == "neuralprophet":
                 for epochs in neural_epochs:
                     try:
-                        result = run_forecast_logic(ForecastRequest(**data.dict(), model_type="neuralprophet", hyperparams={"n_epochs": epochs}), model)
+                        result = run_forecast_logic(
+                            ForecastRequest(**data.dict(), model_type="neuralprophet", hyperparams={"n_epochs": epochs}),
+                            "neuralprophet")
                         if result["metrics"]["RMSE"] < best_rmse:
                             best_result = result
                             best_rmse = result["metrics"]["RMSE"]
                             best_meta = {"model": "neuralprophet", "n_epochs": epochs}
                     except Exception as e:
                         logger.warning(f"NeuralProphet failed with epochs={epochs}: {e}")
-                        continue
 
         if not best_result:
-            raise HTTPException(status_code=500, detail="AutoML failed to produce a valid result.")
+            raise HTTPException(status_code=500, detail="AutoML failed to produce a valid forecast.")
 
         best_result["auto_ml_config"] = best_meta
         return best_result
@@ -165,7 +164,7 @@ async def forecast(data: ForecastRequest, user: dict = Depends(verify_api_key)):
         logger.error(f"Forecasting error: {e}")
         raise HTTPException(status_code=500, detail=f"Forecasting error: {str(e)}")
 
-# === Stripe Webhook ===
+# === POST /webhook/stripe ===
 @app.post("/webhook/stripe")
 async def stripe_webhook(request: Request):
     payload = await request.body()
@@ -193,7 +192,7 @@ async def stripe_webhook(request: Request):
 
     return {"status": "ok"}
 
-# === Admin: Issue API Key ===
+# === POST /admin/issue-key ===
 @app.post("/admin/issue-key")
 async def issue_api_key(user_email: str, plan: str, days_valid: int = 30):
     new_key = secrets.token_urlsafe(32)
@@ -206,12 +205,12 @@ async def issue_api_key(user_email: str, plan: str, days_valid: int = 30):
     logger.info(f"[Admin] Issued key for {user_email} plan={plan}")
     return {"api_key": new_key, "expires_at": expires}
 
-# === Health Check ===
+# === GET /health ===
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
-# === Run Locally ===
+# === Optional: Run locally ===
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8080))
