@@ -15,35 +15,45 @@ from math import sqrt
 import logging
 import time
 
-# === Configure Logging ===
+from supabase import create_client, Client
+
+# === Logging ===
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("forecast-api")
 
+# === App Initialization ===
 app = FastAPI()
 
-# === Stripe Config ===
+# === Supabase Configuration ===
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://bhpqdxwveaafuztflewt.supabase.co")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "your_service_role_key_here")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
+# === Stripe Configuration ===
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 endpoint_secret = os.getenv("STRIPE_WEBHOOK_SECRET")
 
-# === In-Memory API Key Store ===
-api_keys = {}
-
-# === API Key Auth ===
+# === API Key Validation ===
 def verify_api_key(request: Request):
     if request.url.scheme != "https":
         raise HTTPException(status_code=403, detail="HTTPS is required.")
+
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing API key.")
     key = auth.split(" ")[1]
-    user = api_keys.get(key)
-    if not user:
-        raise HTTPException(status_code=403, detail="Invalid or expired API key.")
-    if user["expires_at"] < datetime.utcnow():
-        raise HTTPException(status_code=403, detail="API key expired.")
-    return user
 
-# === ForecastRequest Schema ===
+    response = supabase.table("api_keys").select("*").eq("key", key).single().execute()
+    if not response.data:
+        raise HTTPException(status_code=403, detail="Invalid or expired API key.")
+
+    record = response.data
+    if datetime.fromisoformat(record["expires_at"].replace("Z", "")) < datetime.utcnow():
+        raise HTTPException(status_code=403, detail="API key expired.")
+
+    return record
+
+# === Forecast Request Schema ===
 class ForecastRequest(BaseModel):
     dates: List[str]
     values: List[float]
@@ -140,7 +150,6 @@ async def forecast(data: ForecastRequest, user: dict = Depends(verify_api_key)):
                                 best_meta = {"model": "prophet", "changepoint_prior_scale": cps, "seasonality_mode": seasonality}
                         except Exception as e:
                             logger.warning(f"Prophet failed with cps={cps}, seasonality={seasonality}: {e}")
-                            continue
             elif model == "neuralprophet":
                 for epochs in neural_epochs:
                     try:
@@ -151,7 +160,6 @@ async def forecast(data: ForecastRequest, user: dict = Depends(verify_api_key)):
                             best_meta = {"model": "neuralprophet", "n_epochs": epochs}
                     except Exception as e:
                         logger.warning(f"NeuralProphet failed with epochs={epochs}: {e}")
-                        continue
 
         if not best_result:
             raise HTTPException(status_code=500, detail="AutoML failed to produce a valid result.")
@@ -164,7 +172,7 @@ async def forecast(data: ForecastRequest, user: dict = Depends(verify_api_key)):
         logger.error(f"Forecasting error: {e}")
         raise HTTPException(status_code=500, detail=f"Forecasting error: {str(e)}")
 
-# === Stripe Webhook ===
+# === Stripe Webhook Endpoint ===
 @app.post("/webhook/stripe")
 async def stripe_webhook(request: Request):
     payload = await request.body()
@@ -181,24 +189,30 @@ async def stripe_webhook(request: Request):
         plan = session.get("metadata", {}).get("plan", "basic")
         new_key = secrets.token_urlsafe(32)
         expires = datetime.utcnow() + timedelta(days=30)
-        api_keys[new_key] = {
+
+        supabase.table("api_keys").insert([{
+            "key": new_key,
             "user_id": email,
             "plan": plan,
-            "expires_at": expires
-        }
+            "expires_at": expires.isoformat()
+        }]).execute()
+
         logger.info(f"[Stripe] Issued key for {email} plan={plan}")
     return {"status": "ok"}
 
-# === Admin: Issue API Key ===
+# === Admin: Issue Key ===
 @app.post("/admin/issue-key")
 async def issue_api_key(user_email: str, plan: str, days_valid: int = 30):
     new_key = secrets.token_urlsafe(32)
     expires = datetime.utcnow() + timedelta(days=days_valid)
-    api_keys[new_key] = {
+
+    supabase.table("api_keys").insert([{
+        "key": new_key,
         "user_id": user_email,
         "plan": plan,
-        "expires_at": expires
-    }
+        "expires_at": expires.isoformat()
+    }]).execute()
+
     logger.info(f"[Admin] Issued key for {user_email} plan={plan}")
     return {"api_key": new_key, "expires_at": expires}
 
@@ -207,9 +221,8 @@ async def issue_api_key(user_email: str, plan: str, days_valid: int = 30):
 async def health():
     return {"status": "ok"}
 
-# === Run Locally or in Render ===
+# === Run Locally or Render ===
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8080))  # <-- This line is critical
-    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
-
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run("app:app", host="0.0.0.0", port=port)
