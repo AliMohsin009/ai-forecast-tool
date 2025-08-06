@@ -33,7 +33,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 endpoint_secret = os.getenv("STRIPE_WEBHOOK_SECRET")
 
-# === API Key Validation ===
+# === API Key Validation (Fixed) ===
 def verify_api_key(request: Request):
     if request.url.scheme != "https":
         raise HTTPException(status_code=403, detail="HTTPS is required.")
@@ -43,13 +43,18 @@ def verify_api_key(request: Request):
         raise HTTPException(status_code=401, detail="Missing API key.")
     key = auth.split(" ")[1]
 
-    response = supabase.table("api_keys").select("*").eq("key", key).single().execute()
-    if not response.data:
+    response = supabase.table("api_keys").select("*").eq("key", key).execute()
+
+    if response.status_code != 200 or not response.data:
         raise HTTPException(status_code=403, detail="Invalid or expired API key.")
 
-    record = response.data
-    if datetime.fromisoformat(record["expires_at"].replace("Z", "")) < datetime.utcnow():
-        raise HTTPException(status_code=403, detail="API key expired.")
+    record = response.data[0]
+
+    if "expires_at" in record:
+        expires_str = record["expires_at"].replace("Z", "")
+        expires_dt = datetime.fromisoformat(expires_str)
+        if expires_dt < datetime.utcnow():
+            raise HTTPException(status_code=403, detail="API key expired.")
 
     return record
 
@@ -221,7 +226,7 @@ async def issue_api_key(user_email: str, plan: str, days_valid: int = 30):
 async def health():
     return {"status": "ok"}
 
-# === Run Locally or Render ===
+# === Run Locally or on Render ===
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8080))
